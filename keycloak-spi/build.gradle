@@ -1,0 +1,78 @@
+// Runs INSIDE Keycloak's own runtime, not Spring - deliberately does NOT use
+// ipie.library-conventions or ipie.spring-service-conventions (both pull in Spring Boot
+// dependencies this module must never have on its classpath). Keycloak provides its own SPI
+// jars, Jackson, etc. at runtime from its own lib/ directory - everything here is compileOnly so
+// the built jar contains only this module's own classes, with zero risk of a classloader/version
+// clash inside Keycloak's process (a shaded/fat jar would bundle a second copy of classes
+// Keycloak already has, which is exactly the failure mode to avoid).
+plugins {
+    id 'ipie.java-conventions'
+}
+
+description = 'Custom Keycloak first-broker-login Authenticator for the pillar SSO federation feature ' +
+        '(IBBI/NCLT/NCLAT/MCA) - resolves a brokered pillar login back to an existing ipie user via ' +
+        'ipie-user-service, instead of Keycloak\'s default auto-create/email-match behavior.'
+
+// Must match the running Keycloak's own version exactly (26.6.3 - confirmed against both the
+// standalone instance at localhost:9090 and docker-compose.yml's pinned image tag) - these
+// coordinates are published to Maven Central by the Keycloak project itself.
+ext.keycloakVersion = '26.6.3'
+
+// Resolves the platform as published artifacts, like its parent build - this module moved out of
+// ipie-platform-mca with ipie-iam-service on 2026-08-09.
+def ipiePlatform = providers.gradleProperty('ipiePlatformVersion').get()
+
+repositories {
+    mavenLocal()
+    maven {
+        name = 'ipiePlatform'
+        url = uri('https://maven.pkg.github.com/ipie-cms/ipie-platform-mca')
+        credentials {
+            username = providers.gradleProperty('ipie.packages.user')
+                    .orElse(providers.environmentVariable('GITHUB_ACTOR')).getOrElse('')
+            password = providers.gradleProperty('ipie.packages.token')
+                    .orElse(providers.environmentVariable('GITHUB_TOKEN')).getOrElse('')
+        }
+    }
+    mavenCentral()
+}
+
+dependencies {
+    // ipie.java-conventions declares Lombok (unused in this module) with no version - only
+    // ipie.library-conventions/ipie.spring-service-conventions normally supply one via
+    // ipie-parent's platform(); this module uses neither, so it needs its own import purely for
+    // that version constraint (adds no real Spring dependency - platform() only pins versions).
+    // All four Lombok configurations (compileOnly/annotationProcessor for main,
+    // testCompileOnly/testAnnotationProcessor for test) need the platform import independently -
+    // Gradle's test configurations do not inherit it from the main ones.
+    compileOnly platform("in.gov.ipie:ipie-parent:${ipiePlatform}")
+    annotationProcessor platform("in.gov.ipie:ipie-parent:${ipiePlatform}")
+    testCompileOnly platform("in.gov.ipie:ipie-parent:${ipiePlatform}")
+    testAnnotationProcessor platform("in.gov.ipie:ipie-parent:${ipiePlatform}")
+
+    compileOnly "org.keycloak:keycloak-server-spi:${keycloakVersion}"
+    compileOnly "org.keycloak:keycloak-server-spi-private:${keycloakVersion}"
+    compileOnly "org.keycloak:keycloak-services:${keycloakVersion}"
+    // Keycloak ships its own Jackson on the classpath at runtime - compileOnly here for the same
+    // classloader-safety reason as the SPI jars above, not because a version needs pinning.
+    compileOnly 'com.fasterxml.jackson.core:jackson-databind'
+
+    // Test-only - this module's own jar task packages the main source set only, so none of this
+    // ever ships inside the artifact bind-mounted into Keycloak's providers/ directory. Pulling in
+    // ipie-common-libs here (test scope only) lets HmacRequestSignerCrossCheckTest assert this
+    // module's hand-written HMAC signing stays byte-for-byte identical to common-security's
+    // HmacSignature - the actual class, not a re-typed copy of its expected output.
+    testImplementation platform("in.gov.ipie:ipie-parent:${ipiePlatform}")
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testImplementation 'org.assertj:assertj-core'
+    testImplementation "in.gov.ipie:ipie-common-libs:${ipiePlatform}"
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+// Keycloak loads providers by jar, and the platform's docker-compose mounts this by a fixed name.
+// The subproject is called keycloak-spi inside this repository, but the artifact keeps its
+// platform-wide name so the deployment contract does not change with the repository layout.
+tasks.named('jar') {
+    archiveBaseName = 'ipie-keycloak-spi'
+    archiveVersion = ''
+}

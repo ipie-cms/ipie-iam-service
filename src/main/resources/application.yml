@@ -1,0 +1,252 @@
+# This service is secured by default (see ipie.security below and common-security). No
+# spring.security.oauth2.resourceserver.jwt.issuer-uri/jwk-set-uri is set here on purpose: real
+# environments MUST supply one (pointing at Keycloak, e.g. https://keycloak.example.com/realms/ipie)
+# via SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_ISSUER_URI - startup fails loudly without it
+# rather than silently accepting unauthenticated traffic (master standards doc, 14: "Fail startup
+# when mandatory secure configuration is missing"). See application-local.yml for local dev only.
+spring:
+  application:
+    name: ipie-iam-service
+
+  datasource:
+    # Was ipie/ipie (the Dockerized postgres service's creds, see docker-compose.yml). Pointed at
+    # local Postgres instead, using its default postgres/postgres superuser account.
+    # Shares ipie-user-service's database (Database Mandatory Controls: User/IAM shared-database
+    # exception) - not its own ipie_iam_service database anymore. See V9's rename migration for
+    # how the 3 previously-colliding table names were resolved before this cutover, and
+    # spring.flyway.table below for why the migration history stays separate even though the
+    # schema is now shared.
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/ipie_user_service}
+    username: ${SPRING_DATASOURCE_USERNAME:postgres}
+    password: ${SPRING_DATASOURCE_PASSWORD:postgres}
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      # Flyway owns the schema - Hibernate only ever validates it matches (master standards doc,
+      # 7.1: "Do not use Hibernate ddl-auto=update in controlled environments").
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    # Migrations connect as the OWNER role, the running application as the APP role (Stage 5, item
+    # 1). Separating them is what makes least privilege mean anything: a runtime connection that
+    # could create a table could also drop the grants that constrain it. Flyway reuses
+    # spring.datasource.url and only swaps the credentials.
+    #
+    # Both default to the datasource's own credentials, so a developer running against `postgres`
+    # needs no extra configuration and sees no behaviour change. Deployed environments set all four.
+    # The fallback resolves the datasource's own PROPERTY, not the environment variable behind it.
+    # Referencing SPRING_DATASOURCE_USERNAME here meant that anything setting the credentials another
+    # way - a test's dynamic properties, a config server, a properties file - left Flyway falling
+    # back to a literal postgres/postgres, which fails to authenticate or, worse, succeeds as a
+    # superuser and undoes the separation this exists to create.
+    user: ${SPRING_FLYWAY_USER:${spring.datasource.username}}
+    password: ${SPRING_FLYWAY_PASSWORD:${spring.datasource.password}}
+    # Own migration-history table, not the default flyway_schema_history - ipie-user-service's
+    # migrations run in the same physical database/schema now, and each service's timeline must
+    # be tracked independently (see Database_Environment_Configuration.md's User/IAM
+    # shared-database exception).
+    table: flyway_schema_history_iam
+    # The public schema is non-empty the first time this service connects (ipie-user-service's
+    # tables already exist there) - Flyway refuses to migrate against a non-empty schema with no
+    # history table of its own as a safety check. baseline-version 0 (not Flyway's default of 1)
+    # is required here so the baseline marks the schema as "nothing of mine has run yet" rather
+    # than skipping V1 - every one of this service's own migrations still needs to run in full.
+    baseline-on-migrate: true
+    baseline-version: 0
+
+  security:
+    oauth2:
+      client:
+        registration:
+          # This service's own Keycloak client (serviceAccountsEnabled=true), used for the
+          # client-credentials grant behind KeycloakUserManagementClient - see
+          # deploy/keycloak/realm-export.json for its serviceAccountClientRoles grant (manage-users
+          # + manage-realm, since this service also creates/manages realm role definitions).
+          keycloak-admin:
+            client-id: ${IPIE_KEYCLOAK_CLIENT_ID:ipie-iam-service}
+            client-secret: ${IPIE_KEYCLOAK_CLIENT_SECRET:ipie-iam-service-secret}
+            authorization-grant-type: client_credentials
+        provider:
+          keycloak-admin:
+            token-uri: ${IPIE_KEYCLOAK_BASE_URL:http://localhost:8080}/realms/${IPIE_KEYCLOAK_REALM:ipie}/protocol/openid-connect/token
+
+server:
+  port: 8080
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # "prometheus" here is unrelated to and does not affect "metrics"/tracing below - it just
+        # exposes the /actuator/prometheus scrape endpoint that common-observability's
+        # micrometer-registry-prometheus dependency wires in automatically (master standards doc,
+        # 5.6). See docker-compose.yml's prometheus service for the scrape config that reads it.
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: when-authorized
+  health:
+    # Both spring-kafka and spring-boot-starter-amqp are always on the classpath (this service can
+    # be configured for either broker - see EventPublisherConfig), so Spring Boot auto-registers
+    # health indicators for BOTH regardless of which one is actually active. Whichever broker
+    # ISN'T configured has no spring.kafka.bootstrap-servers/spring.rabbitmq.host set, so its
+    # indicator checks Spring Boot's own default target (localhost:9092/localhost:5672) - nothing
+    # is listening there inside the container, so it always reports DOWN and drags overall
+    # /actuator/health DOWN even when the service and its actually-configured broker are fine.
+    # Disabled here; re-enable only the one matching whichever broker this deployment actually
+    # uses if you want real broker-connectivity health monitoring.
+    kafka:
+      enabled: false
+    rabbit:
+      enabled: false
+    # spring-boot-starter-data-redis (via common-cache) is always on the classpath too, so Spring
+    # Boot auto-registers a Redis health indicator the same way it does for Kafka/RabbitMQ above -
+    # purely from classpath presence, not from whether spring.data.redis.host is actually set.
+    # Caching has a safe "do nothing" fallback (IpieCacheAutoConfiguration's no-op CacheManager),
+    # so an unreachable/unconfigured Redis should never drag overall service health down; disabled
+    # here for the same reason as kafka/rabbit above.
+    redis:
+      enabled: false
+  tracing:
+    sampling:
+      # 100% here so the reference template's traces are always visible; real services should
+      # sample far lower (e.g. 0.1) once traffic volume makes full sampling expensive.
+      probability: ${IPIE_TRACING_SAMPLING_PROBABILITY:1.0}
+  otlp:
+    tracing:
+      # Jaeger's all-in-one image exposes an OTLP/HTTP receiver on 4318 (see docker-compose.yml's
+      # jaeger service); set to http://jaeger:4318/v1/traces inside Compose via IPIE_OTLP_ENDPOINT.
+      endpoint: ${IPIE_OTLP_ENDPOINT:http://localhost:4318/v1/traces}
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+ipie:
+  openapi:
+    # Title comes from spring.application.name; only this sentence is the service's
+    # own. It used to be a copied class, which is how every service ended up serving
+    # the template's description as its public API summary.
+    description: "iam service API"
+  credentials:
+    # How long a set-password link stays usable. Matches ipie-user-service's
+    # ipie.registration.verification-token-ttl, because the two links are emailed from the same
+    # moment and a user who acts on one will reasonably expect the other to still work.
+    setup-token-ttl: ${IPIE_CREDENTIALS_SETUP_TOKEN_TTL:PT48H}
+  security:
+    enabled: true
+    permissions-claim: permissions
+    # Empty by default (no cross-origin access); set via IPIE_CORS_ALLOWED_ORIGINS for a browser
+    # frontend, e.g. http://localhost:5173 for the ipie-web local dev server.
+    cors-allowed-origins: ${IPIE_CORS_ALLOWED_ORIGINS:}
+    # This service had no public endpoints at all until credentials moved here. The one below is
+    # unauthenticated by necessity: it is how a user who has never had a password sets their first
+    # one, so there is nothing to authenticate them with. The one-time setup token from their email
+    # is the authorisation, and the rate limit below bounds guessing at it.
+    public-paths:
+      - /actuator/health/**
+      - /actuator/info
+      - /actuator/prometheus
+      - /v3/api-docs/**
+      - /swagger-ui/**
+      - /swagger-ui.html
+      - /api/v1/credentials/password
+    rate-limit:
+      # Order matters: RateLimitFilter takes the FIRST matching rule, so the specific path has to
+      # precede any pattern that would swallow it.
+      rules:
+        # Setting an initial password: one call per user, ever. A legitimate caller needs a single
+        # request - possibly two if they mistype and the policy rejects the first - so this is
+        # generous already. It is the only unauthenticated way into the credential store, so the
+        # budget is deliberately small.
+        - pattern: /api/v1/credentials/password
+          limit: ${IPIE_RATE_LIMIT_SET_PASSWORD_LIMIT:5}
+          window: ${IPIE_RATE_LIMIT_SET_PASSWORD_WINDOW:PT1M}
+        # Changing a password is authenticated, so the caller is already known; this guards against
+        # an authenticated client hammering the endpoint rather than against anonymous guessing.
+        - pattern: /api/v1/credentials/password/change
+          limit: ${IPIE_RATE_LIMIT_CHANGE_PASSWORD_LIMIT:10}
+          window: ${IPIE_RATE_LIMIT_CHANGE_PASSWORD_WINDOW:PT1M}
+    keycloak:
+      user-management:
+        # Safe for a business service's normal request path (client-credentials grant, narrowly
+        # scoped realm-management roles) - see KeycloakUserManagementClient's Javadoc.
+        enabled: true
+        base-url: ${IPIE_KEYCLOAK_BASE_URL:http://localhost:8080}
+        realm: ${IPIE_KEYCLOAK_REALM:ipie}
+        registration-id: keycloak-admin
+    # HMAC request signing - this service is the *verifier* for both of its internal,
+    # service-to-service-only endpoints (see HmacSignatureVerificationFilter, wired in this
+    # service's own SecurityConfig). Two separate keys, least-privilege: a compromised key only
+    # lets one caller impersonate one relationship. No safe default for a real shared secret -
+    # both must be set.
+    hmac:
+      keys:
+        user-to-iam: ${IPIE_SECURITY_HMAC_KEY_USER_TO_IAM:}
+        spi-to-iam: ${IPIE_SECURITY_HMAC_KEY_SPI_TO_IAM:}
+      protected-paths:
+        - /internal/accounts
+        - /internal/pillar-links/resolve
+        # The login path. ipie-keycloak-spi signs this call with the spi-to-iam key above; without
+        # it listed here the signature is sent and never checked, which is worse than not signing at
+        # all - it looks protected in the client and is not on the server.
+        - /internal/credentials/verify
+  idempotency:
+    ttl: ${IPIE_IDEMPOTENCY_TTL:PT24H}
+  events:
+    kafka:
+      # spring.kafka.bootstrap-servers is deliberately left unset here - EventPublisherConfig
+      # only activates KafkaEventPublisher when it's actually provided (e.g. via
+      # SPRING_KAFKA_BOOTSTRAP_SERVERS in docker-compose.yml); otherwise events fall back to the
+      # logging reference implementation, or to RabbitMQ below if that's configured instead.
+      topic: ${IPIE_EVENTS_KAFKA_TOPIC:ipie-iam-service.events}
+    rabbitmq:
+      # spring.rabbitmq.host is deliberately left unset here too - only activates when Kafka
+      # isn't configured (see EventPublisherConfig's precedence: Kafka > RabbitMQ > logging), so
+      # the two never activate at the same time. Standby broker in case Kafka doesn't get
+      # organizational clearance - set SPRING_RABBITMQ_HOST to switch to it, no code change.
+      exchange: ${IPIE_EVENTS_RABBITMQ_EXCHANGE:ipie-iam-service.events}
+      queue: ${IPIE_EVENTS_RABBITMQ_QUEUE:ipie-iam-service.events.user-event-log}
+  integrations:
+    user-service:
+      # Cross-service consumption of ipie-user-service's own USER_VERIFIED/ACCOUNT_LINKED/
+      # ACCOUNT_UNLINKED events - see UserServiceEventConsumerConfig/UserVerifiedEventConsumer/
+      # KafkaUserVerifiedEventConsumer/PillarResolutionEventConsumer/
+      # KafkaPillarResolutionEventConsumer.
+      default-role: ${IPIE_INTEGRATIONS_USER_SERVICE_DEFAULT_ROLE:STAKEHOLDER}
+      rabbitmq:
+        exchange: ${IPIE_INTEGRATIONS_USER_SERVICE_RABBITMQ_EXCHANGE:ipie-user-service.events}
+        user-verified-queue: ${IPIE_INTEGRATIONS_USER_SERVICE_RABBITMQ_QUEUE:ipie-iam-service.events.user-verified}
+      # ipie-user-service publishes every event type to this one topic (Kafka has no per-routing-
+      # key queue equivalent) - the Kafka-side consumers each filter to the event type(s) they
+      # care about themselves. Matches ipie-user-service's own ipie.events.kafka.topic default.
+      kafka:
+        topic: ${IPIE_INTEGRATIONS_USER_SERVICE_KAFKA_TOPIC:ipie-user-service.events}
+  cache:
+    # spring.data.redis.host is deliberately left unset here too, same reasoning as
+    # spring.kafka.bootstrap-servers above - IpieCacheAutoConfiguration only activates the
+    # Redis-backed CacheManager when it's actually provided (e.g. via SPRING_DATA_REDIS_HOST in
+    # docker-compose.yml); otherwise @Cacheable methods run uncached via the no-op fallback.
+    # default-ttl/ttls below are shown at their Java-level defaults for visibility - override
+    # per-cache-name via ipie.cache.ttls.<cache-name> (e.g. IPIE_CACHE_TTLS_USER-LOOKUP=PT1M).
+    default-ttl: ${IPIE_CACHE_DEFAULT_TTL:PT10M}
+    ttls:
+      # RoleServiceImpl#getRolesForKeycloakUser - hit on every dashboard load (GET
+      # /api/v1/users/me/roles); evicted explicitly on every role assignment (see @CacheEvict on
+      # assignRole/assignDefaultRole), so this TTL is only a backstop, not the primary consistency
+      # mechanism.
+      user-roles: ${IPIE_CACHE_TTLS_USER_ROLES:PT5M}
+      # PillarResolutionService#resolve - the single hottest path in the platform (every
+      # pillar-SSO login); evicted explicitly on upsert/delete, same reasoning as above.
+      pillar-resolution: ${IPIE_CACHE_TTLS_PILLAR_RESOLUTION:PT5M}
