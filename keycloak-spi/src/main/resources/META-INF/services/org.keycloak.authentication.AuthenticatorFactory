@@ -1,0 +1,3 @@
+in.gov.ipie.keycloak.spi.pillar.PillarLinkResolverAuthenticatorFactory
+in.gov.ipie.keycloak.spi.credential.IpieValidatePassword
+in.gov.ipie.keycloak.spi.credential.IpieUsernamePasswordFormFactory

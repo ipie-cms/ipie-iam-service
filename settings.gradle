@@ -1,0 +1,43 @@
+// Standalone service repository. The ipie.* convention plugins, the version BOM and the shared
+// libraries all resolve as PUBLISHED artifacts from ipie-platform-mca - there is no includeBuild
+// and no project(':...') here, which is the whole point of the extraction.
+//
+// pluginManagement must be the first block in a settings file, so the platform version is read from
+// gradle.properties here rather than from a variable declared above it.
+pluginManagement {
+    def ipieVersion = settings.providers.gradleProperty('ipiePlatformVersion').get()
+
+    repositories {
+        mavenLocal()
+        maven {
+            name = 'ipiePlatform'
+            url = uri('https://maven.pkg.github.com/ipie-cms/ipie-platform-mca')
+            credentials {
+                username = providers.gradleProperty('ipie.packages.user')
+                        .orElse(providers.environmentVariable('GITHUB_ACTOR')).getOrElse('')
+                password = providers.gradleProperty('ipie.packages.token')
+                        .orElse(providers.environmentVariable('GITHUB_TOKEN')).getOrElse('')
+            }
+        }
+        gradlePluginPortal()
+    }
+    resolutionStrategy {
+        eachPlugin {
+            if (requested.id.id.startsWith('ipie.')) {
+                useModule("in.gov.ipie:ipie-build-conventions:${ipieVersion}")
+            }
+        }
+    }
+}
+
+rootProject.name = 'ipie-iam-service'
+
+// ipie-keycloak-spi lives here rather than in the platform repository: it and this service
+// implement one feature together - stakeholder SSO federation - across the
+// POST /internal/stakeholder-links/resolve contract, HMAC-signed by the SPI and verified by this
+// service's HmacSignatureVerificationFilter. That contract changes on both sides at once, and the
+// SPI already carries a cross-check test asserting its hand-written HMAC stays byte-identical to
+// common-security's. Keeping them in separate repositories would mean two coordinated releases for
+// one change. It is not a service: no Spring Boot, no container - it deploys as a jar into
+// Keycloak's providers directory.
+include 'keycloak-spi'
